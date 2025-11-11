@@ -1,113 +1,162 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-从原始中文语料构建 lexicon.tsv 的小工具。
+Build a lexicon.tsv from the THUOCL corpus.
 
-输入：
-    一个目录，里面是若干 .txt 文件（UTF-8），内容是中文文本（未分词也没关系）。
+Expected THUOCL layout (relative to project root):
 
-处理：
-    - 用 jieba 分词
-    - 只保留“全部是中文”的 token
-    - 只保留长度在 [min_len, max_len] 的词（一般 2~6 比较适合做梗）
-    - 统计频次，按频次降序输出为 TSV：word<TAB>freq
+    corpus/
+        THUOCL/
+            data/
+                THUOCL_chengyu.txt
+                THUOCL_it.txt
+                ...
 
-示例：
-    python build_lexicon_from_corpus.py \
-        --input_dir ./corpus_txt \
-        --out_lex lexicon.tsv \
-        --min_len 2 \
-        --max_len 6 \
-        --min_freq 5
+Each data file has lines like:
+
+    坚定不移\t54113
+
+We treat the first field as the phrase and the last field as the integer frequency.
+All THUOCL files are merged into a single lexicon, summing frequencies for
+duplicate phrases across domains.
 """
 
-import os
-import re
 import argparse
-from collections import Counter
-from typing import Iterator
-
-import jieba
-from tqdm import tqdm
-
-CHINESE_RE = re.compile(r"^[\u4e00-\u9fff]+$")
+import collections
+import pathlib
+from typing import Dict, Iterable, Tuple
 
 
-def iter_text_files(input_dir: str) -> Iterator[str]:
-    for root, _, files in os.walk(input_dir):
-        for name in files:
-            if not name.lower().endswith(".txt"):
+ROOT = pathlib.Path(__file__).resolve().parent
+DEFAULT_THUOCL_DIR = ROOT / "corpus" / "THUOCL" / "data"
+DEFAULT_OUTPUT = ROOT / "lexicon.tsv"
+
+
+def parse_thuocl_file(path: pathlib.Path) -> Iterable[Tuple[str, int]]:
+    """
+    Yield (phrase, freq) pairs from a THUOCL .txt file.
+
+    Lines look like:
+        坚定不移\t54113
+    or occasionally have extra whitespace.
+    """
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
                 continue
-            path = os.path.join(root, name)
-            yield path
 
-
-def build_lexicon(
-    input_dir: str,
-    min_len: int = 2,
-    max_len: int = 6,
-    min_freq: int = 5,
-) -> Counter:
-    counter = Counter()
-    files = list(iter_text_files(input_dir))
-    if not files:
-        print(f"[WARN] No .txt files found under {input_dir}")
-        return counter
-
-    for path in tqdm(files, desc="Scanning corpus"):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except UnicodeDecodeError:
-            # 简单跳过非 UTF-8 文件
-            continue
-
-        # jieba 分词
-        for token in jieba.cut(text):
-            token = token.strip()
-            if not token:
+            # split on whitespace (tab or spaces)
+            parts = line.split()
+            if len(parts) < 2:
                 continue
-            # 只保留“全部是中文”的 token
-            if not CHINESE_RE.match(token):
-                continue
-            # 长度限制
-            if len(token) < min_len or len(token) > max_len:
-                continue
-            counter[token] += 1
 
-    # 过滤低频词
-    if min_freq > 1:
-        for w in list(counter.keys()):
-            if counter[w] < min_freq:
-                del counter[w]
+            # last token is frequency, everything before is the phrase
+            freq_str = parts[-1]
+            phrase = "".join(parts[:-1])
 
+            try:
+                freq = int(freq_str)
+            except ValueError:
+                # if we can't parse frequency, skip this line
+                continue
+
+            if not phrase:
+                continue
+
+            yield phrase, freq
+
+
+def load_thuocl(thuocl_dir: pathlib.Path) -> Dict[str, int]:
+    """
+    Load all THUOCL .txt files under `thuocl_dir` and return
+    a dict: phrase -> total frequency.
+    """
+    counter: Dict[str, int] = collections.Counter()
+
+    if not thuocl_dir.exists():
+        raise FileNotFoundError(f"THUOCL directory not found: {thuocl_dir}")
+
+    for path in sorted(thuocl_dir.glob("THUOCL_*.txt")):
+        print(f"[INFO] Loading {path.name}...")
+        for phrase, freq in parse_thuocl_file(path):
+            counter[phrase] += freq
+
+    print(f"[INFO] Loaded {len(counter)} unique phrases from THUOCL.")
     return counter
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input_dir", required=True, help="包含若干 .txt 中文语料文件的目录")
-    ap.add_argument("--out_lex", required=True, help="输出 lexicon.tsv 路径")
-    ap.add_argument("--min_len", type=int, default=2, help="最小词长")
-    ap.add_argument("--max_len", type=int, default=6, help="最大词长")
-    ap.add_argument("--min_freq", type=int, default=5, help="最小频次阈值")
-    args = ap.parse_args()
+def filter_and_sort(
+    freq_dict: Dict[str, int],
+    min_freq: int = 1,
+    top_k: int | None = None,
+) -> Iterable[Tuple[str, int]]:
+    """
+    Apply a min frequency filter and return phrases sorted by frequency desc.
+    Optionally keep only top_k entries.
+    """
+    items = [(p, f) for p, f in freq_dict.items() if f >= min_freq]
+    items.sort(key=lambda x: x[1], reverse=True)
 
-    counter = build_lexicon(
-        input_dir=args.input_dir,
-        min_len=args.min_len,
-        max_len=args.max_len,
-        min_freq=args.min_freq,
+    if top_k is not None:
+        items = items[:top_k]
+
+    return items
+
+
+def write_lexicon(
+    items: Iterable[Tuple[str, int]],
+    output_path: pathlib.Path,
+) -> None:
+    """
+    Write lexicon.tsv with columns:
+        phrase \t freq
+
+    If your downstream code expects different columns (e.g. phrase \t weight),
+    you can adjust this function accordingly.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as out:
+        for phrase, freq in items:
+            out.write(f"{phrase}\t{freq}\n")
+    print(f"[INFO] Wrote lexicon to {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build lexicon.tsv from THUOCL corpus."
+    )
+    parser.add_argument(
+        "--thuocl-dir",
+        type=pathlib.Path,
+        default=DEFAULT_THUOCL_DIR,
+        help=f"Path to THUOCL data directory (default: {DEFAULT_THUOCL_DIR})",
+    )
+    parser.add_argument(
+        "--output",
+        type=pathlib.Path,
+        default=DEFAULT_OUTPUT,
+        help=f"Output lexicon file (default: {DEFAULT_OUTPUT})",
+    )
+    parser.add_argument(
+        "--min-freq",
+        type=int,
+        default=1,
+        help="Minimum frequency threshold for phrases (default: 1)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=None,
+        help="Keep only top-K phrases by frequency (default: keep all)",
     )
 
-    print(f"[INFO] Collected {len(counter)} words after filtering.")
+    args = parser.parse_args()
 
-    # 按频次降序写出 TSV
-    with open(args.out_lex, "w", encoding="utf-8") as out:
-        for word, freq in counter.most_common():
-            out.write(f"{word}\t{freq}\n")
-
-    print(f"[INFO] Wrote lexicon to {args.out_lex}")
+    freq_dict = load_thuocl(args.thuocl_dir)
+    items = filter_and_sort(freq_dict, min_freq=args.min_freq, top_k=args.top_k)
+    write_lexicon(items, args.output)
 
 
 if __name__ == "__main__":

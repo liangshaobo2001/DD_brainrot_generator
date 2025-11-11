@@ -6,15 +6,19 @@ Model 1 pilot for 谢彬烂梗生成器
 功能：
 - 从词频词表构建：
     * word list
-    * 完整拼音序列 -> 词 的映射（用于等长子串 equal_sub）
+    * 完整拼音序列 -> 词 的映射（用于等长子串 equal_sub，当前默认关闭）
     * 拼音 bigram 倒排表（用于超串 super）
 - 给定 query：
     * 计算 query 的拼音序列
     * 召回：
-        - equal_sub: 候选拼音 == query 拼音的某个连续子串（>= min_sub_len）
         - super: 候选拼音中包含 query 全段拼音（side > middle 可加分）
+        - （可选）equal_sub: 候选拼音 == query 拼音的某个连续子串（>= min_sub_len）
     * 为每个候选计算一个轻量得分（位置 + 长度差 + 编辑距离 + 词频）
     * 输出 topk 候选，方便你后续接语义模型做 Model 2
+
+本版本的硬规则：
+- 只保留 “superset” 候选，即 len(cand) >= len(query) + 1
+- 支持通过 max_len_delta 限制候选最长比 query 多几个音节
 
 用法示例：
     python xiebin_model1_pilot.py \
@@ -50,7 +54,6 @@ except Exception:
 def normalize_pinyin_syllable(py: str) -> str:
     """小写 + 去掉数字声调"""
     py = py.lower()
-    # 非严格模式下可能自带数字声调，统统去掉
     out = []
     for ch in py:
         if not ch.isdigit():
@@ -228,7 +231,7 @@ class Model1Indexer:
         # 再次算 max_log_freq 用于归一化
         self.max_log_freq = max((w.log_freq for w in self.words), default=1.0)
 
-    # ---------- 辅助函数 ----------
+    # ---------- equal_sub（当前默认不用，但保留代码） ----------
 
     def _find_equal_sub_candidates(
         self,
@@ -240,6 +243,7 @@ class Model1Indexer:
         """
         equal_sub：候选拼音 == query 拼音的某个连续子串（>= min_sub_len）。
         返回 wid -> CandidateHit 的 dict（score 先不算）。
+        当前主流程默认不启用 equal_sub。
         """
         m = len(q_py)
         if m < min_sub_len:
@@ -261,7 +265,6 @@ class Model1Indexer:
                     we = self.words[wid]
                     if exclude_text is not None and we.text == exclude_text:
                         continue
-                    # equal_sub 的 pos_type 暂时设为 "na"
                     hits[wid] = CandidateHit(
                         wid=wid,
                         text=we.text,
@@ -277,14 +280,22 @@ class Model1Indexer:
                     )
         return hits
 
+    # ---------- super: 只保留 superset，支持 max_len_delta ----------
+
     def _find_super_candidates(
         self,
         q_py: List[str],
         exclude_text: Optional[str] = None,
+        min_len_delta: int = 1,
+        max_len_delta: Optional[int] = None,
     ) -> Dict[int, CandidateHit]:
         """
-        super：候选拼音中包含 query 全段拼音。
+        super：候选拼音中包含 query 全段拼音（superset）。
         使用 bigram 倒排粗筛，然后逐词检查连续子串。
+
+        约束：
+        - len_diff = len(cand) - len(query) >= min_len_delta（默认 1，保证是真正的 superset）
+        - 若 max_len_delta 不为 None，则 len_diff <= max_len_delta
         """
         m = len(q_py)
         if m == 0:
@@ -297,6 +308,11 @@ class Model1Indexer:
             for we in self.words:
                 if exclude_text is not None and we.text == exclude_text:
                     continue
+                len_diff = len(we.pinyin) - m
+                if len_diff < min_len_delta:
+                    continue
+                if max_len_delta is not None and len_diff > max_len_delta:
+                    continue
                 for pos, syl in enumerate(we.pinyin):
                     if syl == q0:
                         pos_type = _pos_type(pos, pos + 1, len(we.pinyin))
@@ -305,7 +321,7 @@ class Model1Indexer:
                             text=we.text,
                             relation="super",
                             pos_type=pos_type,
-                            len_diff=len(we.pinyin) - m,
+                            len_diff=len_diff,
                             edit_no_tone=0.0,  # 后面统一算
                             log_freq=we.log_freq,
                             log_freq_norm=we.log_freq / (self.max_log_freq + 1e-9),
@@ -334,6 +350,15 @@ class Model1Indexer:
             if exclude_text is not None and we.text == exclude_text:
                 continue
 
+            # 长度差过滤：只保留 superset，并限制最大长度差
+            q_len = m
+            cand_len = len(we.pinyin)
+            len_diff = cand_len - q_len
+            if len_diff < min_len_delta:
+                continue
+            if max_len_delta is not None and len_diff > max_len_delta:
+                continue
+
             # 精检：q_py 是否为 we.pinyin 的连续子串
             pos = _find_subsequence_start(we.pinyin, q_py)
             if pos is None:
@@ -341,14 +366,14 @@ class Model1Indexer:
 
             align_start = pos
             align_end = pos + m
-            pos_type = _pos_type(align_start, align_end, len(we.pinyin))
+            pos_type = _pos_type(align_start, align_end, cand_len)
 
-            hits[wid] = CandidateHit(
+            hits[we.wid] = CandidateHit(
                 wid=we.wid,
                 text=we.text,
                 relation="super",
                 pos_type=pos_type,
-                len_diff=len(we.pinyin) - m,
+                len_diff=len_diff,
                 edit_no_tone=0.0,  # 后面统一计算
                 log_freq=we.log_freq,
                 log_freq_norm=we.log_freq / (self.max_log_freq + 1e-9),
@@ -359,20 +384,28 @@ class Model1Indexer:
 
         return hits
 
+    # ---------- 统一搜索接口 ----------
+
     def search(
         self,
         query_text: str,
         topk: int = 20,
         min_sub_len: int = 2,
         max_sub_len: Optional[int] = None,
-        include_equal_sub: bool = True,
+        include_equal_sub: bool = False,   # 默认只看 super，不用 equal_sub
         include_super: bool = True,
         exclude_self: bool = True,
+        max_len_delta: Optional[int] = 4,  # superset 最多多几个音节
+        min_len_delta: int = 1,           # superset 至少多 1 个音节
     ) -> List[CandidateHit]:
         """
         统一接口：
         - query_text: 原词
         - 返回经过轻量打分排序的候选
+
+        当前默认行为：
+        - 只返回 superset（len_diff >= 1）
+        - superset 最多多 max_len_delta 个音节（可在调用时调整）
         """
         q_py = text_to_pinyin_list(query_text)
 
@@ -393,6 +426,8 @@ class Model1Indexer:
             sp_hits = self._find_super_candidates(
                 q_py=q_py,
                 exclude_text=exclude_text,
+                min_len_delta=min_len_delta,
+                max_len_delta=max_len_delta,
             )
             # 如果同一个 wid 同时出现在 equal_sub 和 super 中，保留“关系更强”的 super
             for wid, hit in sp_hits.items():
@@ -413,12 +448,11 @@ class Model1Indexer:
 
     def _get_word_by_id(self, wid: int) -> WordEntry:
         # 这里假设 wid 与 self.words 的顺序一致
-        # 如果未来做过滤/重排，可以维护 id->entry 的 dict
         return self.words[wid]
 
     def _light_score(self, hit: CandidateHit) -> float:
         """
-        轻量打分：
+        轻量打分（保持原来的长度惩罚不变）：
         score = 0.3 * position_bonus
               - 0.25 * |len_diff|
               - 0.4  * edit_no_tone
@@ -499,7 +533,6 @@ def load_lexicon_tsv(path: str) -> List[Tuple[str, float]]:
             agg[word] = agg.get(word, 0.0) + freq
 
     items = list(agg.items())
-    # 方便后面使用高频词，先按频次降序排序
     items.sort(key=lambda x: x[1], reverse=True)
     return items
 
@@ -510,16 +543,41 @@ def load_lexicon_tsv(path: str) -> List[Tuple[str, float]]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Model 1 pilot for 谢彬烂梗生成器（拼音检索 + 轻量打分）"
+        description="Model 1 pilot for 谢彬烂梗生成器（拼音检索 + 轻量打分，默认只返回 superset）"
     )
     parser.add_argument("--lex", required=True, help="词表路径（TSV: word<TAB>freq）")
     parser.add_argument("--query", required=True, help="原词（中文）")
     parser.add_argument("--topk", type=int, default=20, help="返回候选数量")
-    parser.add_argument("--min_sub_len", type=int, default=2, help="equal_sub 最小音节长度")
-    parser.add_argument("--max_sub_len", type=int, default=None, help="equal_sub 最大音节长度（默认=query长度）")
-    parser.add_argument("--no_equal_sub", action="store_true", help="不召回 equal_sub 候选")
-    parser.add_argument("--no_super", action="store_true", help="不召回 super 候选")
-    parser.add_argument("--include_self", action="store_true", help="是否保留与原词文本完全相同的候选")
+    parser.add_argument(
+        "--max_len_delta",
+        type=int,
+        default=4,
+        help="superset 最多允许比 query 多出的音节数（默认 4）",
+    )
+    parser.add_argument(
+        "--no_super",
+        action="store_true",
+        help="不召回 super 候选（一般不用，默认开启）",
+    )
+    parser.add_argument(
+        "--include_self",
+        action="store_true",
+        help="是否保留与原词文本完全相同的候选",
+    )
+    # equal_sub 相关参数保留但通常不用
+    parser.add_argument("--min_sub_len", type=int, default=2, help="equal_sub 最小音节长度（默认 2）")
+    parser.add_argument(
+        "--max_sub_len",
+        type=int,
+        default=None,
+        help="equal_sub 最大音节长度（默认=query长度）",
+    )
+    parser.add_argument(
+        "--include_equal_sub",
+        action="store_true",
+        help="是否同时召回 equal_sub 候选（默认 False，仅 superset）",
+    )
+
     args = parser.parse_args()
 
     lexicon = load_lexicon_tsv(args.lex)
@@ -530,9 +588,11 @@ def main():
         topk=args.topk,
         min_sub_len=args.min_sub_len,
         max_sub_len=args.max_sub_len,
-        include_equal_sub=not args.no_equal_sub,
+        include_equal_sub=args.include_equal_sub,
         include_super=not args.no_super,
         exclude_self=not args.include_self,
+        max_len_delta=args.max_len_delta,
+        min_len_delta=1,  # 只要 superset：至少多一个音节
     )
 
     result = {
